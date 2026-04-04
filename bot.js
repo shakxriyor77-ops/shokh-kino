@@ -5,7 +5,7 @@ const express = require('express'); // Cron-job uchun
 
 // Renderda BOT_TOKEN deb yozasiz
 const BOT_TOKEN = process.env.BOT_TOKEN; 
-const ADMIN_ID = 7312694067; 
+const ADMIN_ID = 8448862547; 
 
 const bot = new Telegraf(BOT_TOKEN);
 let db;
