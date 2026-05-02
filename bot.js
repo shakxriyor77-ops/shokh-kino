@@ -1,16 +1,19 @@
 const { Telegraf, Markup } = require('telegraf');
-const sqlite3 = require('sqlite3');
-const { open } = require('sqlite');
-const express = require('express'); // Cron-job uchun
+const { Pool } = require('pg');
+const express = require('express');
 
-// Renderda BOT_TOKEN deb yozasiz
-const BOT_TOKEN = process.env.BOT_TOKEN; 
-const ADMIN_ID = 8030496668; 
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = 8030496668;
 
 const bot = new Telegraf(BOT_TOKEN);
-let db;
 
-// CRON-JOB UCHUN WEB SERVER (Bot o'chib qolmasligi uchun)
+// PostgreSQL ulanish
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+// CRON-JOB UCHUN WEB SERVER
 const app = express();
 app.get('/', (req, res) => res.send('Bot is online!'));
 const PORT = process.env.PORT || 3000;
@@ -18,17 +21,26 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 // 1. BAZANI ISHGA TUSHIRISH
 async function initDB() {
-    db = await open({ filename: './cinema.db', driver: sqlite3.Database });
-    await db.exec(`
-        CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, file_id TEXT, file_type TEXT, bio TEXT);
-        CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT, chat_id TEXT);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS movies (
+            code TEXT PRIMARY KEY,
+            file_id TEXT,
+            file_type TEXT,
+            bio TEXT
+        );
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            link TEXT,
+            chat_id TEXT
+        );
     `);
+    console.log('✅ Baza tayyor!');
 }
 
 // 2. OBUNANI TEKSHIRISH
 async function checkTelegramSubs(ctx) {
     if (ctx.from.id === Number(ADMIN_ID)) return [];
-    const channels = await db.all('SELECT * FROM channels');
+    const { rows: channels } = await pool.query('SELECT * FROM channels');
     let mustJoin = [];
     for (const ch of channels) {
         if (ch.chat_id.startsWith('-100')) {
@@ -42,7 +54,7 @@ async function checkTelegramSubs(ctx) {
 }
 
 async function getAllUnsubLinks(ctx) {
-    const channels = await db.all('SELECT * FROM channels');
+    const { rows: channels } = await pool.query('SELECT * FROM channels');
     let links = [];
     for (const ch of channels) {
         if (ch.chat_id.startsWith('-100')) {
@@ -83,11 +95,11 @@ bot.hears('🗑 Kinoni o\'chirish', (ctx) => {
 
 bot.hears('🎥 Kinolar ro\'yxati', async (ctx) => {
     if (ctx.from.id !== Number(ADMIN_ID)) return;
-    const movies = await db.all('SELECT code, bio FROM movies LIMIT 50');
+    const { rows: movies } = await pool.query('SELECT code, bio FROM movies LIMIT 50');
     if (movies.length === 0) return ctx.reply("📭 Bazada kinolar yo'q.");
     let msg = "🎥 **Bazdagi kinolar ro'yxati:**\n\n";
     movies.forEach(m => {
-        msg += `🔑 Kod: \`${m.code}\` | 📝 ${m.bio.substring(0, 20)}...\n`;
+        msg += `🔑 Kod: \`${m.code}\` | 📝 ${m.bio ? m.bio.substring(0, 20) : ''}...\n`;
     });
     msg += "\n🗑 O'chirish uchun: `DEL#KOD`";
     ctx.reply(msg, { parse_mode: 'Markdown' });
@@ -95,7 +107,7 @@ bot.hears('🎥 Kinolar ro\'yxati', async (ctx) => {
 
 bot.hears('📢 Kanallar sozlamasi', async (ctx) => {
     if (ctx.from.id !== Number(ADMIN_ID)) return;
-    const channels = await db.all('SELECT * FROM channels');
+    const { rows: channels } = await pool.query('SELECT * FROM channels');
     let msg = "📢 **Kanallar:**\n\n";
     channels.forEach(ch => msg += `🆔 ${ch.id} | ${ch.link}\n`);
     ctx.reply(msg, Markup.inlineKeyboard([[Markup.button.callback('➕ Qo\'shish', 'start_add_ch'), Markup.button.callback('🗑 O\'chirish', 'del_channel')]]));
@@ -123,15 +135,18 @@ bot.on('text', async (ctx) => {
     if (ctx.from.id === Number(ADMIN_ID)) {
         if (text.startsWith('ADD#')) {
             const p = text.split('#');
-            if (p.length === 3) { await db.run('INSERT INTO channels (link, chat_id) VALUES (?, ?)', [p[1], p[2]]); return ctx.reply("✅ Qo'shildi!"); }
+            if (p.length === 3) {
+                await pool.query('INSERT INTO channels (link, chat_id) VALUES ($1, $2)', [p[1], p[2]]);
+                return ctx.reply("✅ Qo'shildi!");
+            }
         }
         if (text.startsWith('DEL_CH#')) {
-            await db.run('DELETE FROM channels WHERE id = ?', [text.split('#')[1]]);
+            await pool.query('DELETE FROM channels WHERE id = $1', [text.split('#')[1]]);
             return ctx.reply("🗑 Kanal o'chirildi.");
         }
         if (text.startsWith('DEL#')) {
-            const res = await db.run('DELETE FROM movies WHERE code = ?', [text.split('#')[1]]);
-            return ctx.reply(res.changes > 0 ? "✅ Kino o'chirildi!" : "❌ Topilmadi.");
+            const res = await pool.query('DELETE FROM movies WHERE code = $1', [text.split('#')[1]]);
+            return ctx.reply(res.rowCount > 0 ? "✅ Kino o'chirildi!" : "❌ Topilmadi.");
         }
         if (['🎬 Kino qo\'shish', '🗑 Kinoni o\'chirish', '📢 Kanallar sozlamasi', '🎥 Kinolar ro\'yxati'].includes(text)) return;
     }
@@ -144,10 +159,13 @@ bot.on('text', async (ctx) => {
         return ctx.reply("🛑 Avval homiylarga obuna bo'ling!", Markup.inlineKeyboard(buttons));
     }
 
-    const movie = await db.get('SELECT * FROM movies WHERE code = ?', [text]);
+    const { rows } = await pool.query('SELECT * FROM movies WHERE code = $1', [text]);
+    const movie = rows[0];
     if (movie) {
         const cap = `🎬 Kod: ${text}\n\n${movie.bio || ""}`;
-        movie.file_type === 'video' ? await ctx.replyWithVideo(movie.file_id, { caption: cap }) : await ctx.replyWithDocument(movie.file_id, { caption: cap });
+        movie.file_type === 'video'
+            ? await ctx.replyWithVideo(movie.file_id, { caption: cap })
+            : await ctx.replyWithDocument(movie.file_id, { caption: cap });
     } else if (!isNaN(text)) ctx.reply("😔 Topilmadi.");
 });
 
@@ -158,7 +176,10 @@ bot.on(['video', 'document'], async (ctx) => {
         let code = cap.split(' ')[0], bio = cap.substring(code.length).trim();
         const fId = ctx.message.video ? ctx.message.video.file_id : ctx.message.document.file_id;
         const type = ctx.message.video ? 'video' : 'document';
-        await db.run('INSERT OR REPLACE INTO movies (code, file_id, file_type, bio) VALUES (?, ?, ?, ?)', [code, fId, type, bio]);
+        await pool.query(
+            'INSERT INTO movies (code, file_id, file_type, bio) VALUES ($1, $2, $3, $4) ON CONFLICT (code) DO UPDATE SET file_id=$2, file_type=$3, bio=$4',
+            [code, fId, type, bio]
+        );
         ctx.reply(`✅ Saqlandi! Kod: ${code}`);
     }
 });
